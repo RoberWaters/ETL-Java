@@ -1,0 +1,9 @@
+# Ignorar archivos de compilación y dependencias
+*.class
+bin/
+out/
+
+
+# Configuraciones del sistema
+.DS_Store
+Thumbs.db
