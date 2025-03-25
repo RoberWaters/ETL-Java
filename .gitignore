@@ -7,3 +7,5 @@ out/
 # Configuraciones del sistema
 .DS_Store
 Thumbs.db
+
+test.sql
