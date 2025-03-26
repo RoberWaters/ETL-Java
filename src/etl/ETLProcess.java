@@ -28,23 +28,16 @@ public class ETLProcess {
                 if (sourceConnection != null && destinationConnection != null) {
                     System.out.println("Conexión a las bases de datos establecida con éxito.");
                     
-                    System.out.println("Seleccione el método de extracción:");
-                    System.out.println("1. Ingresar consulta SQL manualmente");
-                    System.out.println("2. Seleccionar una tabla de la base de datos");
-                    int opcion = scanner.nextInt();
-                    scanner.nextLine();
+                    // Selección de datos origen
+                    System.out.println("\n=== CONFIGURACIÓN DE ORIGEN ===");
+                    String query = configurarOrigen(scanner, sourceConnection);
+                    
+                    // Selección de tabla destino
+                    System.out.println("\n=== CONFIGURACIÓN DE DESTINO ===");
+                    String tableDestination = seleccionarTablaDestino(scanner, destinationConnection);
 
-                    String query;
-                    if (opcion == 1) {
-                        System.out.print("Ingrese la consulta SQL para extraer los datos: ");
-                        query = scanner.nextLine();
-                    } else {
-                        query = seleccionarTabla(scanner, sourceConnection);
-                    }
-
-                    System.out.print("Ingrese el nombre de la tabla de destino: ");
-                    String tableDestination = scanner.nextLine();
-
+                    // Proceso ETL
+                    System.out.println("\n=== TRANSFORMACIÓN ===");
                     extractTransformLoad(sourceConnection, destinationConnection, query, tableDestination, scanner);
                 } else {
                     System.out.println("Error al conectar a las bases de datos.");
@@ -81,23 +74,35 @@ public class ETLProcess {
         }
     }
 
-    private static String seleccionarTabla(Scanner scanner, Connection connection) throws SQLException {
-        System.out.println("Obteniendo lista de tablas disponibles...");
-        DatabaseMetaData metaData = connection.getMetaData();
-        ResultSet tables = metaData.getTables(null, null, "%", new String[]{"TABLE"});
+    private static String configurarOrigen(Scanner scanner, Connection connection) throws SQLException {
+        System.out.println("Seleccione el método de extracción:");
+        System.out.println("1. Ingresar consulta SQL manualmente");
+        System.out.println("2. Seleccionar una tabla de la base de datos");
+        int opcion = scanner.nextInt();
+        scanner.nextLine();
 
-        List<String> tablaNombres = new ArrayList<>();
-        while (tables.next()) {
-            String tableName = tables.getString("TABLE_NAME");
-            System.out.println("- " + tableName);
-            tablaNombres.add(tableName);
+        if (opcion == 1) {
+            System.out.print("Ingrese la consulta SQL para extraer los datos: ");
+            return scanner.nextLine();
+        } else {
+            return seleccionarTablaOrigen(scanner, connection);
         }
+    }
 
+    private static String seleccionarTablaOrigen(Scanner scanner, Connection connection) throws SQLException {
+        List<String> tablaNombres = listarTablasDisponibles(connection, "origen");
+        
         System.out.print("Ingrese el nombre de la tabla origen: ");
         String tablaOrigen = scanner.nextLine();
+        
+        while (!tablaNombres.contains(tablaOrigen)) {
+            System.out.println("La tabla '" + tablaOrigen + "' no existe.");
+            System.out.print("Por favor ingrese un nombre de tabla válido: ");
+            tablaOrigen = scanner.nextLine();
+        }
 
-        System.out.println("Columnas disponibles en la tabla de origen:");
-        ResultSet columns = metaData.getColumns(null, null, tablaOrigen, "%");
+        System.out.println("\nColumnas disponibles en '" + tablaOrigen + "':");
+        ResultSet columns = connection.getMetaData().getColumns(null, null, tablaOrigen, "%");
         List<String> columnasDisponibles = new ArrayList<>();
         while (columns.next()) {
             String columnName = columns.getString("COLUMN_NAME");
@@ -105,7 +110,7 @@ public class ETLProcess {
             columnasDisponibles.add(columnName);
         }
 
-        System.out.print("Ingrese los nombres de las columnas a exportar, separados por comas: ");
+        System.out.print("\nIngrese los nombres de las columnas a exportar (separadas por comas): ");
         String[] columnasSeleccionadas = scanner.nextLine().split(",");
         List<String> columnasValidas = Arrays.stream(columnasSeleccionadas)
                 .map(String::trim)
@@ -119,7 +124,42 @@ public class ETLProcess {
         return "SELECT " + String.join(", ", columnasValidas) + " FROM " + tablaOrigen;
     }
 
-    private static void extractTransformLoad(Connection sourceConn, Connection destConn, String query, String tableDestination, Scanner scanner) {
+    private static String seleccionarTablaDestino(Scanner scanner, Connection connection) throws SQLException {
+        List<String> tablasDestino = listarTablasDisponibles(connection, "destino");
+        
+        System.out.print("Ingrese el nombre de la tabla de destino: ");
+        String tablaDestino = scanner.nextLine();
+        
+        while (!tablasDestino.contains(tablaDestino)) {
+            System.out.println("La tabla '" + tablaDestino + "' no existe en el destino.");
+            System.out.print("Por favor ingrese un nombre de tabla válido: ");
+            tablaDestino = scanner.nextLine();
+        }
+        
+        return tablaDestino;
+    }
+
+    private static List<String> listarTablasDisponibles(Connection connection, String tipo) throws SQLException {
+        List<String> tablaNombres = new ArrayList<>();
+        DatabaseMetaData metaData = connection.getMetaData();
+        ResultSet tables = metaData.getTables(null, null, "%", new String[]{"TABLE"});
+        
+        System.out.println("\nTablas disponibles en la base de datos " + tipo + ":");
+        while (tables.next()) {
+            String tableName = tables.getString("TABLE_NAME");
+            System.out.println("- " + tableName);
+            tablaNombres.add(tableName);
+        }
+        
+        if (tablaNombres.isEmpty()) {
+            System.out.println("No se encontraron tablas.");
+        }
+        
+        return tablaNombres;
+    }
+
+    private static void extractTransformLoad(Connection sourceConn, Connection destConn, String query, 
+                                          String tableDestination, Scanner scanner) {
         try (Statement stmt = sourceConn.createStatement();
              ResultSet rs = stmt.executeQuery(query)) {
     
@@ -133,107 +173,124 @@ public class ETLProcess {
             }
     
             // Solicitar las transformaciones
-            Map<String, String> transformaciones = new HashMap<>();
-            for (String columna : columnas) {
-                System.out.println("Seleccione la transformación para la columna " + columna + ":");
-                System.out.println("1. Convertir a minúsculas");
-                System.out.println("2. Convertir a mayúsculas");
-                System.out.println("3. Extraer parte de fecha (Año, Mes, Día, Hora)");
-                System.out.println("4. Concatenar con otro valor");
-                System.out.println("5. Ninguna transformación");
-    
-                int opcion = scanner.nextInt();
-                scanner.nextLine();  // Limpiar el buffer del scanner
-    
-                switch (opcion) {
-                    case 1:
-                        transformaciones.put(columna, "lower");
-                        break;
-                    case 2:
-                        transformaciones.put(columna, "upper");
-                        break;
-                    case 3:
-                        System.out.println("Seleccione la parte de la fecha: (Año, Mes, Día, Hora)");
-                        String parteFecha = scanner.nextLine();
-                        transformaciones.put(columna, "date:" + parteFecha);
-                        break;
-                    case 4:
-                        System.out.print("Ingrese el valor con el que desea concatenar: ");
-                        String valorConcatenar = scanner.nextLine();
-                        transformaciones.put(columna, "concat:" + valorConcatenar);
-                        break;
-                    case 5:
-                        transformaciones.put(columna, "none");
-                        break;
-                    default:
-                        System.out.println("Opción no válida. No se realizará transformación.");
-                        transformaciones.put(columna, "none");
-                        break;
-                }
-            }
+            Map<String, String> transformaciones = solicitarTransformaciones(scanner, columnas);
     
             // Construcción de la consulta MERGE
-            String mergeSQL = "MERGE INTO " + tableDestination + " AS destino " +
-                    "USING (VALUES (" + String.join(", ", Collections.nCopies(columnCount, "?")) + ")) " +
-                    "AS origen (" + String.join(", ", columnas) + ") " +
-                    "ON destino." + columnas.get(0) + " = origen." + columnas.get(0) + " " +
-                    "WHEN MATCHED THEN UPDATE SET " +
-                    columnas.stream().skip(1).map(c -> "destino." + c + " = origen." + c).collect(Collectors.joining(", ")) + " " +
-                    "WHEN NOT MATCHED THEN INSERT (" + String.join(", ", columnas) + ") " +
-                    "VALUES (" + String.join(", ", Collections.nCopies(columnCount, "?")) + ");";
+            String mergeSQL = construirMergeSQL(tableDestination, columnas);
     
             try (PreparedStatement pstmt = destConn.prepareStatement(mergeSQL)) {
                 while (rs.next()) {
-                    for (int i = 0; i < columnCount; i++) {
-                        String columna = columnas.get(i);
-                        Object valor = rs.getObject(columna);
-    
-                        // Aplicar las transformaciones
-                        if ("lower".equals(transformaciones.get(columna))) {
-                            valor = valor.toString().toLowerCase();
-                        } else if ("upper".equals(transformaciones.get(columna))) {
-                            valor = valor.toString().toUpperCase();
-                        } else if (transformaciones.get(columna).startsWith("date:")) {
-                            // Extraer parte de la fecha (Año, Mes, Día, Hora)
-                            String tipoFecha = transformaciones.get(columna).split(":")[1];
-                            if (valor instanceof java.sql.Date) {
-                                java.sql.Date date = (java.sql.Date) valor;
-                                java.util.Calendar calendar = java.util.Calendar.getInstance();
-                                calendar.setTime(date);
-                                switch (tipoFecha.toLowerCase()) {
-                                    case "año":
-                                        valor = calendar.get(java.util.Calendar.YEAR);
-                                        break;
-                                    case "mes":
-                                        valor = calendar.get(java.util.Calendar.MONTH) + 1; // Mes en base 1
-                                        break;
-                                    case "día":
-                                        valor = calendar.get(java.util.Calendar.DAY_OF_MONTH);
-                                        break;
-                                    case "hora":
-                                        valor = calendar.get(java.util.Calendar.HOUR_OF_DAY);
-                                        break;
-                                    default:
-                                        System.out.println("Transformación de fecha no válida.");
-                                        break;
-                                }
-                            }
-                        } else if (transformaciones.get(columna).startsWith("concat:")) {
-                            // Concatenar valor con otro valor
-                            String valorConcatenar = transformaciones.get(columna).split(":")[1];
-                            valor = valor.toString() + valorConcatenar;
-                        }
-    
-                        pstmt.setObject(i + 1, valor);
-                        pstmt.setObject(i + 1 + columnCount, valor); // Para el INSERT
-                    }
-                    pstmt.executeUpdate();
+                    aplicarTransformacionesYEjectuarMerge(rs, pstmt, columnas, transformaciones, columnCount);
                 }
-                System.out.println("Proceso ETL completado con éxito.");
+                System.out.println("\nProceso ETL completado con éxito. Datos cargados en '" + tableDestination + "'");
             }
         } catch (SQLException e) {
             System.out.println("Error en el proceso ETL:");
             e.printStackTrace();
         }
     }
-}     
+
+    private static Map<String, String> solicitarTransformaciones(Scanner scanner, List<String> columnas) {
+        Map<String, String> transformaciones = new HashMap<>();
+        System.out.println("\nConfiguración de transformaciones:");
+
+        for (String columna : columnas) {
+            System.out.println("\nColumna: " + columna);
+            System.out.println("1. Convertir a minúsculas");
+            System.out.println("2. Convertir a mayúsculas");
+            System.out.println("3. Extraer parte de fecha");
+            System.out.println("4. Concatenar con otro valor");
+            System.out.println("5. Ninguna transformación");
+            System.out.print("Seleccione opción: ");
+
+            int opcion = scanner.nextInt();
+            scanner.nextLine();
+
+            switch (opcion) {
+                case 1:
+                    transformaciones.put(columna, "lower");
+                    break;
+                case 2:
+                    transformaciones.put(columna, "upper");
+                    break;
+                case 3:
+                    System.out.print("Parte a extraer (Año/Mes/Día/Hora): ");
+                    String parteFecha = scanner.nextLine();
+                    transformaciones.put(columna, "date:" + parteFecha);
+                    break;
+                case 4:
+                    System.out.print("Valor a concatenar: ");
+                    String valorConcatenar = scanner.nextLine();
+                    transformaciones.put(columna, "concat:" + valorConcatenar);
+                    break;
+                default:
+                    transformaciones.put(columna, "none");
+                    break;
+            }
+        }
+        return transformaciones;
+    }
+
+    private static String construirMergeSQL(String tableDestination, List<String> columnas) {
+        return "MERGE INTO " + tableDestination + " AS destino " +
+               "USING (VALUES (" + String.join(", ", Collections.nCopies(columnas.size(), "?")) + ")) " +
+               "AS origen (" + String.join(", ", columnas) + ") " +
+               "ON destino." + columnas.get(0) + " = origen." + columnas.get(0) + " " +
+               "WHEN MATCHED THEN UPDATE SET " +
+               columnas.stream().skip(1).map(c -> "destino." + c + " = origen." + c).collect(Collectors.joining(", ")) + " " +
+               "WHEN NOT MATCHED THEN INSERT (" + String.join(", ", columnas) + ") " +
+               "VALUES (" + String.join(", ", Collections.nCopies(columnas.size(), "?")) + ");";
+    }
+
+    private static void aplicarTransformacionesYEjectuarMerge(ResultSet rs, PreparedStatement pstmt, 
+            List<String> columnas, Map<String, String> transformaciones, int columnCount) throws SQLException {
+        for (int i = 0; i < columnCount; i++) {
+            String columna = columnas.get(i);
+            Object valor = aplicarTransformacion(rs.getObject(columna), transformaciones.get(columna));
+            pstmt.setObject(i + 1, valor);
+            pstmt.setObject(i + 1 + columnCount, valor);
+        }
+        pstmt.executeUpdate();
+    }
+
+    private static Object aplicarTransformacion(Object valor, String transformacion) {
+        if (valor == null || "none".equals(transformacion)) {
+            return valor;
+        }
+
+        switch (transformacion.split(":")[0]) {
+            case "lower":
+                return valor.toString().toLowerCase();
+            case "upper":
+                return valor.toString().toUpperCase();
+            case "date":
+                return extraerParteFecha(valor, transformacion.split(":")[1]);
+            case "concat":
+                return valor.toString() + transformacion.split(":")[1];
+            default:
+                return valor;
+        }
+    }
+
+    private static Object extraerParteFecha(Object valor, String parteFecha) {
+        if (!(valor instanceof java.util.Date)) {
+            return valor;
+        }
+
+        java.util.Calendar calendar = java.util.Calendar.getInstance();
+        calendar.setTime((java.util.Date) valor);
+
+        switch (parteFecha.toLowerCase()) {
+            case "año":
+                return calendar.get(java.util.Calendar.YEAR);
+            case "mes":
+                return calendar.get(java.util.Calendar.MONTH) + 1;
+            case "día":
+                return calendar.get(java.util.Calendar.DAY_OF_MONTH);
+            case "hora":
+                return calendar.get(java.util.Calendar.HOUR_OF_DAY);
+            default:
+                return valor;
+        }
+    }
+}
