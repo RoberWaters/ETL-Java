@@ -2,8 +2,8 @@ package src.etl;
 
 import java.io.InputStream;
 import java.sql.*;
-import java.util.Properties;
-import java.util.Scanner;
+import java.util.*;
+import java.util.stream.Collectors;
 
 public class ETLProcess {
 
@@ -11,24 +11,32 @@ public class ETLProcess {
         Scanner scanner = new Scanner(System.in);
 
         try {
-            // El usuario ingresa la consulta SQL completa
-            System.out.print("Ingrese la consulta SQL para extraer los datos: ");
-            String query = scanner.nextLine();
-
-            System.out.print("Ingrese el nombre de la tabla de destino: ");
-            String tableDestination = scanner.nextLine();
-
             Connection sourceConnection = connectToDatabase("db.origen.url", "db.origen.user", "db.origen.password");
             Connection destinationConnection = connectToDatabase("db.destino.url", "db.destino.user", "db.destino.password");
 
             if (sourceConnection != null && destinationConnection != null) {
                 System.out.println("Conexión a las bases de datos establecida con éxito.");
+                System.out.println("Seleccione el método de extracción:");
+                System.out.println("1. Ingresar consulta SQL manualmente");
+                System.out.println("2. Seleccionar una tabla de la base de datos");
+                int opcion = scanner.nextInt();
+                scanner.nextLine();
+
+                String query;
+                if (opcion == 1) {
+                    System.out.print("Ingrese la consulta SQL para extraer los datos: ");
+                    query = scanner.nextLine();
+                } else {
+                    query = seleccionarTabla(scanner, sourceConnection);
+                }
+
+                System.out.print("Ingrese el nombre de la tabla de destino: ");
+                String tableDestination = scanner.nextLine();
                 extractTransformLoad(sourceConnection, destinationConnection, query, tableDestination);
             } else {
                 System.out.println("Error al conectar a las bases de datos.");
             }
 
-            // Cerrar conexiones
             if (sourceConnection != null) sourceConnection.close();
             if (destinationConnection != null) destinationConnection.close();
 
@@ -67,6 +75,44 @@ public class ETLProcess {
         }
     }
 
+    private static String seleccionarTabla(Scanner scanner, Connection connection) throws SQLException {
+        System.out.println("Obteniendo lista de tablas disponibles...");
+        DatabaseMetaData metaData = connection.getMetaData();
+        ResultSet tables = metaData.getTables(null, null, "%", new String[]{"TABLE"});
+
+        List<String> tablaNombres = new ArrayList<>();
+        while (tables.next()) {
+            String tableName = tables.getString("TABLE_NAME");
+            System.out.println("- " + tableName);
+            tablaNombres.add(tableName);
+        }
+
+        System.out.print("Ingrese el nombre de la tabla origen: ");
+        String tablaOrigen = scanner.nextLine();
+
+        System.out.println("Columnas disponibles en la tabla de origen:");
+        ResultSet columns = metaData.getColumns(null, null, tablaOrigen, "%");
+        List<String> columnasDisponibles = new ArrayList<>();
+        while (columns.next()) {
+            String columnName = columns.getString("COLUMN_NAME");
+            System.out.println("- " + columnName);
+            columnasDisponibles.add(columnName);
+        }
+
+        System.out.print("Ingrese los nombres de las columnas a exportar, separados por comas: ");
+        String[] columnasSeleccionadas = scanner.nextLine().split(",");
+        List<String> columnasValidas = Arrays.stream(columnasSeleccionadas)
+                .map(String::trim)
+                .filter(columnasDisponibles::contains)
+                .collect(Collectors.toList());
+
+        if (columnasValidas.isEmpty()) {
+            throw new IllegalArgumentException("No se seleccionaron columnas válidas.");
+        }
+
+        return "SELECT " + String.join(", ", columnasValidas) + " FROM " + tablaOrigen;
+    }
+
     private static void extractTransformLoad(Connection sourceConnection, Connection destinationConnection, String query, String tableDestination) {
         try (Statement stmt = sourceConnection.createStatement();
              ResultSet rs = stmt.executeQuery(query)) {
@@ -79,24 +125,21 @@ public class ETLProcess {
                 return;
             }
 
-            // Construir consulta INSERT dinámica
-            StringBuilder insertQuery = new StringBuilder("INSERT INTO ").append(tableDestination).append(" VALUES (");
-            for (int i = 0; i < columnCount; i++) {
-                insertQuery.append("?");
-                if (i < columnCount - 1) insertQuery.append(", ");
+            List<String> columnas = new ArrayList<>();
+            for (int i = 1; i <= columnCount; i++) {
+                columnas.add(metaData.getColumnName(i));
             }
-            insertQuery.append(")");
 
-            try (PreparedStatement pstmt = destinationConnection.prepareStatement(insertQuery.toString())) {
+            String insertQuery = "INSERT INTO " + tableDestination + " (" + String.join(", ", columnas) + ") VALUES (" +
+                    String.join(", ", Collections.nCopies(columnCount, "?")) + ")";
+
+            try (PreparedStatement pstmt = destinationConnection.prepareStatement(insertQuery)) {
                 while (rs.next()) {
                     for (int i = 1; i <= columnCount; i++) {
                         Object value = rs.getObject(i);
-
-                        // Aplicar transformaciones a cadenas de texto
                         if (value instanceof String) {
-                            value = ((String) value).toUpperCase(); // Convierte a mayúsculas
+                            value = ((String) value).toUpperCase();
                         }
-
                         pstmt.setObject(i, value);
                     }
                     pstmt.executeUpdate();
