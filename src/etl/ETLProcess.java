@@ -232,14 +232,56 @@ public class ETLProcess {
     }
 
     private static String construirMergeSQL(String tableDestination, List<String> columnas) {
-        return "MERGE INTO " + tableDestination + " AS destino " +
-               "USING (VALUES (" + String.join(", ", Collections.nCopies(columnas.size(), "?")) + ")) " +
-               "AS origen (" + String.join(", ", columnas) + ") " +
-               "ON destino." + columnas.get(0) + " = origen." + columnas.get(0) + " " +
-               "WHEN MATCHED THEN UPDATE SET " +
-               columnas.stream().skip(1).map(c -> "destino." + c + " = origen." + c).collect(Collectors.joining(", ")) + " " +
-               "WHEN NOT MATCHED THEN INSERT (" + String.join(", ", columnas) + ") " +
-               "VALUES (" + String.join(", ", Collections.nCopies(columnas.size(), "?")) + ");";
+        // Precalcular tamaños para optimizar StringBuilder
+        int estimatedSize = 200 + tableDestination.length() + (columnas.size() * 30);
+        StringBuilder sql = new StringBuilder(estimatedSize);
+        
+        // Constantes reutilizables
+        final String DESTINO_PREFIX = "destino.";
+        final String ORIGEN_PREFIX = "origen.";
+        final String COMMA_SPACE = ", ";
+        
+        // Construir partes reutilizadas
+        sql.append("MERGE INTO ").append(tableDestination).append(" AS destino ")
+           .append("USING (VALUES (");
+        
+        // Añadir placeholders optimizados
+        for (int i = 0; i < columnas.size(); i++) {
+            if (i > 0) sql.append(COMMA_SPACE);
+            sql.append('?');
+        }
+        
+        sql.append(")) AS origen (")
+           .append(String.join(COMMA_SPACE, columnas))
+           .append(") ON ")
+           .append(DESTINO_PREFIX).append(columnas.get(0))
+           .append(" = ")
+           .append(ORIGEN_PREFIX).append(columnas.get(0))
+           .append(" WHEN MATCHED THEN UPDATE SET ");
+        
+        // Construir parte UPDATE optimizada
+        boolean first = true;
+        for (int i = 1; i < columnas.size(); i++) {
+            if (!first) sql.append(COMMA_SPACE);
+            sql.append(DESTINO_PREFIX).append(columnas.get(i))
+               .append(" = ")
+               .append(ORIGEN_PREFIX).append(columnas.get(i));
+            first = false;
+        }
+        
+        sql.append(" WHEN NOT MATCHED THEN INSERT (")
+           .append(String.join(COMMA_SPACE, columnas))
+           .append(") VALUES (");
+        
+        // Añadir placeholders optimizados para INSERT
+        first = true;
+        for (int i = 0; i < columnas.size(); i++) {
+            if (!first) sql.append(COMMA_SPACE);
+            sql.append('?');
+            first = false;
+        }
+        
+        return sql.append(");").toString();
     }
 
     private static void aplicarTransformacionesYEjectuarMerge(ResultSet rs, PreparedStatement pstmt, 
