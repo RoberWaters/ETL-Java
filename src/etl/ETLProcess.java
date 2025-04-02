@@ -159,35 +159,46 @@ public class ETLProcess {
     }
 
     private static void extractTransformLoad(Connection sourceConn, Connection destConn, String query, 
-                                          String tableDestination, Scanner scanner) {
+    String tableDestination, Scanner scanner) {
         try (Statement stmt = sourceConn.createStatement();
-             ResultSet rs = stmt.executeQuery(query)) {
-    
-            ResultSetMetaData metaData = rs.getMetaData();
-            int columnCount = metaData.getColumnCount();
-            List<String> columnas = new ArrayList<>();
-    
-            // Obtener los nombres de las columnas
-            for (int i = 1; i <= columnCount; i++) {
-                columnas.add(metaData.getColumnName(i));
-            }
-    
-            // Solicitar las transformaciones
-            Map<String, String> transformaciones = solicitarTransformaciones(scanner, columnas);
-    
-            // Construcción de la consulta MERGE
-            String mergeSQL = construirMergeSQL(tableDestination, columnas);
-    
-            try (PreparedStatement pstmt = destConn.prepareStatement(mergeSQL)) {
-                while (rs.next()) {
-                    aplicarTransformacionesYEjectuarMerge(rs, pstmt, columnas, transformaciones, columnCount);
-                }
-                System.out.println("\nProceso ETL completado con éxito. Datos cargados en '" + tableDestination + "'");
-            }
-        } catch (SQLException e) {
-            System.out.println("Error en el proceso ETL:");
-            e.printStackTrace();
-        }
+        ResultSet rs = stmt.executeQuery(query)) {
+
+        ResultSetMetaData metaData = rs.getMetaData();
+        int columnCount = metaData.getColumnCount();
+        List<String> columnas = new ArrayList<>();
+
+    // Obtener los nombres de las columnas
+        for (int i = 1; i <= columnCount; i++) {
+        columnas.add(metaData.getColumnName(i));
+    }
+
+    // Solicitar las transformaciones
+    Map<String, String> transformaciones = solicitarTransformaciones(scanner, columnas);
+
+    // Construcción de la consulta (ahora con verificación de tabla vacía)
+    String sql = construirMergeSQL(tableDestination, columnas, destConn);
+
+    try (PreparedStatement pstmt = destConn.prepareStatement(sql)) {
+        while (rs.next()) {
+        // Aplicar transformaciones y ejecutar
+        for (int i = 0; i < columnCount; i++) {
+        String columna = columnas.get(i);
+        Object valor = aplicarTransformacion(rs.getObject(columna), transformaciones.get(columna));
+        pstmt.setObject(i + 1, valor);
+
+    // Solo necesitamos setear los valores adicionales para MERGE
+    if (sql.startsWith("MERGE")) {
+        pstmt.setObject(i + 1 + columnCount, valor);
+    }
+    }
+        pstmt.executeUpdate();
+    }
+        System.out.println("\nProceso ETL completado con éxito. Datos cargados en '" + tableDestination + "'");
+    }
+    } catch (SQLException e) {
+        System.out.println("Error en el proceso ETL:");
+        e.printStackTrace();
+    }
     }
 
     private static Map<String, String> solicitarTransformaciones(Scanner scanner, List<String> columnas) {
@@ -231,7 +242,46 @@ public class ETLProcess {
         return transformaciones;
     }
 
-    private static String construirMergeSQL(String tableDestination, List<String> columnas) {
+    private static String construirMergeSQL(String tableDestination, List<String> columnas, Connection destConn) throws SQLException {
+        // Primero verificamos si la tabla está vacía
+        boolean tablaVacia = isTablaVacia(destConn, tableDestination);
+        
+        if (tablaVacia) {
+            // Construir INSERT simple optimizado
+            return construirInsertSQL(tableDestination, columnas);
+        } else {
+            // Construir MERGE como antes
+            return construirMergeSQLCompleto(tableDestination, columnas);
+        }
+    }
+    
+    private static boolean isTablaVacia(Connection conn, String tableName) throws SQLException {
+        String sql = "SELECT COUNT(*) FROM " + tableName;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            return rs.next() && rs.getInt(1) == 0;
+        }
+    }
+    
+    private static String construirInsertSQL(String tableDestination, List<String> columnas) {
+        // Precalcular tamaños para optimizar StringBuilder
+        int estimatedSize = 100 + tableDestination.length() + (columnas.size() * 30);
+        StringBuilder sql = new StringBuilder(estimatedSize);
+        
+        sql.append("INSERT INTO ").append(tableDestination).append(" (")
+           .append(String.join(", ", columnas))
+           .append(") VALUES (");
+        
+        // Añadir placeholders optimizados
+        for (int i = 0; i < columnas.size(); i++) {
+            if (i > 0) sql.append(", ");
+            sql.append('?');
+        }
+        
+        return sql.append(")").toString();
+    }
+    
+    private static String construirMergeSQLCompleto(String tableDestination, List<String> columnas) {
         // Precalcular tamaños para optimizar StringBuilder
         int estimatedSize = 200 + tableDestination.length() + (columnas.size() * 30);
         StringBuilder sql = new StringBuilder(estimatedSize);
@@ -283,7 +333,6 @@ public class ETLProcess {
         
         return sql.append(");").toString();
     }
-
     private static void aplicarTransformacionesYEjectuarMerge(ResultSet rs, PreparedStatement pstmt, 
             List<String> columnas, Map<String, String> transformaciones, int columnCount) throws SQLException {
         for (int i = 0; i < columnCount; i++) {
