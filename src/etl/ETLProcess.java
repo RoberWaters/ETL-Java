@@ -167,77 +167,118 @@ try (Statement stmt = sourceConn.createStatement();
     int columnCount = metaData.getColumnCount();
     List<String> columnasOrigen = new ArrayList<>();
 
-    // Obtener los nombres de las columnas del origen
+    // Obtener nombres de columnas origen
     for (int i = 1; i <= columnCount; i++) {
         columnasOrigen.add(metaData.getColumnName(i));
     }
 
-    // Obtener columnas del destino
+    // Obtener estructura tabla destino
     List<String> columnasDestino = obtenerColumnasDestino(destConn, tableDestination);
+    List<String> primaryKeys = obtenerClavesPrimarias(destConn, tableDestination);
 
-    // Mostrar columnas disponibles y permitir mapeo
-    System.out.println("\n=== MAPEO DE COLUMNAS ===");
-    System.out.println("Columnas origen: " + String.join(", ", columnasOrigen));
-    System.out.println("Columnas destino: " + String.join(", ", columnasDestino));
+    // Mapeo de columnas
+    Map<String, String> mapeoColumnas = obtenerMapeoColumnas(scanner, columnasOrigen, columnasDestino, primaryKeys);
     
-    // Crear mapeo entre columnas origen y destino
-    Map<Integer, String> mapeoColumnas = new HashMap<>();
-    for (int i = 0; i < columnasOrigen.size(); i++) {
-        String columnaOrigen = columnasOrigen.get(i);
-        System.out.print("A qué columna destino corresponde '" + columnaOrigen + "'? (deje vacío para omitir): ");
-        String columnaDestino = scanner.nextLine().trim();
-        
-        if (columnasDestino.contains(columnaDestino)) {
-            mapeoColumnas.put(i, columnaDestino);
-        } else if (!columnaDestino.isEmpty()) {
-            System.out.println("La columna destino '" + columnaDestino + "' no existe. Se omitirá.");
-        }
-    }
-
-    // Filtrar columnas que tendrán mapeo
+    // Filtrar columnas mapeadas
     List<String> columnasOrigenMapeadas = new ArrayList<>();
     List<String> columnasDestinoMapeadas = new ArrayList<>();
     for (int i = 0; i < columnasOrigen.size(); i++) {
-        if (mapeoColumnas.containsKey(i)) {
+        if (mapeoColumnas.containsKey(columnasOrigen.get(i))) {
             columnasOrigenMapeadas.add(columnasOrigen.get(i));
-            columnasDestinoMapeadas.add(mapeoColumnas.get(i));
+            columnasDestinoMapeadas.add(mapeoColumnas.get(columnasOrigen.get(i)));
         }
     }
 
-    if (columnasOrigenMapeadas.isEmpty()) {
-        throw new SQLException("No se ha definido ningún mapeo de columnas válido");
-    }
-
-    // Solicitar las transformaciones (usando nombres de origen)
-    System.out.println("\n=== TRANSFORMACIONES ===");
+    // Transformaciones
     Map<String, String> transformaciones = solicitarTransformaciones(scanner, columnasOrigenMapeadas);
 
-    // Construcción de la consulta
-    String sql = construirMergeSQL(tableDestination, columnasOrigenMapeadas, columnasDestinoMapeadas, destConn);
+    // Construir consulta SQL adecuada
+    String sql;
+    int totalParametros;
+    if (!primaryKeys.isEmpty()) {
+        sql = construirUpsertSQL(tableDestination, columnasOrigenMapeadas, columnasDestinoMapeadas, primaryKeys);
+        // Parámetros: valores para UPDATE + valores para WHERE (PKs) + valores para INSERT (si es necesario)
+        totalParametros = (columnasDestinoMapeadas.size() - primaryKeys.size()) + primaryKeys.size() + columnasDestinoMapeadas.size();
+    } else {
+        sql = construirInsertConVerificacion(tableDestination, columnasDestinoMapeadas);
+        // Parámetros: valores para WHERE + valores para INSERT
+        totalParametros = columnasDestinoMapeadas.size() * 2;
+    }
 
     try (PreparedStatement pstmt = destConn.prepareStatement(sql)) {
-        while (rs.next()) {
-            // Aplicar transformaciones y ejecutar
-            int paramIndex = 1;
-            for (int i = 0; i < columnasOrigenMapeadas.size(); i++) {
-                String columnaOrigen = columnasOrigenMapeadas.get(i);
-                Object valor = aplicarTransformacion(rs.getObject(columnaOrigen), 
-                        transformaciones.get(columnaOrigen));
-                pstmt.setObject(paramIndex++, valor);
-            }
+        int batchSize = 0;
+        final int MAX_BATCH_SIZE = 1000;
+        destConn.setAutoCommit(false);
 
-            // Solo necesitamos setear los valores adicionales para MERGE
-            if (sql.startsWith("MERGE")) {
-                for (int i = 0; i < columnasOrigenMapeadas.size(); i++) {
-                    String columnaOrigen = columnasOrigenMapeadas.get(i);
-                    Object valor = aplicarTransformacion(rs.getObject(columnaOrigen), 
+        try {
+            while (rs.next()) {
+                int paramIndex = 1;
+                Object[] valores = new Object[totalParametros];
+                int valoresIndex = 0;
+
+                // Obtener y transformar todos los valores primero
+                for (String columnaOrigen : columnasOrigenMapeadas) {
+                    valores[valoresIndex++] = aplicarTransformacion(rs.getObject(columnaOrigen), 
                             transformaciones.get(columnaOrigen));
-                    pstmt.setObject(paramIndex++, valor);
+                }
+
+                // Lógica para establecer parámetros según el tipo de consulta
+                if (!primaryKeys.isEmpty()) {
+                    // Consulta UPSERT (UPDATE + INSERT)
+                    
+                    // 1. Parámetros para UPDATE (todos menos PKs)
+                    for (int i = 0; i < columnasDestinoMapeadas.size(); i++) {
+                        if (!primaryKeys.contains(columnasDestinoMapeadas.get(i))) {
+                            pstmt.setObject(paramIndex++, valores[i]);
+                        }
+                    }
+                    
+                    // 2. Parámetros para WHERE (solo PKs)
+                    for (String pk : primaryKeys) {
+                        int index = columnasDestinoMapeadas.indexOf(pk);
+                        pstmt.setObject(paramIndex++, valores[index]);
+                    }
+                    
+                    // 3. Parámetros para INSERT (todos)
+                    for (int i = 0; i < columnasDestinoMapeadas.size(); i++) {
+                        pstmt.setObject(paramIndex++, valores[i]);
+                    }
+                } else {
+                    // Consulta INSERT con verificación
+                    
+                    // 1. Parámetros para WHERE (todos)
+                    for (int i = 0; i < columnasDestinoMapeadas.size(); i++) {
+                        pstmt.setObject(paramIndex++, valores[i]);
+                    }
+                    
+                    // 2. Parámetros para INSERT (todos)
+                    for (int i = 0; i < columnasDestinoMapeadas.size(); i++) {
+                        pstmt.setObject(paramIndex++, valores[i]);
+                    }
+                }
+
+                pstmt.addBatch();
+                batchSize++;
+                
+                if (batchSize % MAX_BATCH_SIZE == 0) {
+                    pstmt.executeBatch();
+                    destConn.commit();
+                    System.out.println("Procesados " + batchSize + " registros...");
                 }
             }
-            pstmt.executeUpdate();
+            
+            if (batchSize % MAX_BATCH_SIZE != 0) {
+                pstmt.executeBatch();
+                destConn.commit();
+            }
+            
+            System.out.println("\nProceso ETL completado con éxito. Datos cargados en '" + tableDestination + "'");
+        } catch (SQLException e) {
+            destConn.rollback();
+            throw e;
+        } finally {
+            destConn.setAutoCommit(true);
         }
-        System.out.println("\nProceso ETL completado con éxito. Datos cargados en '" + tableDestination + "'");
     }
 } catch (SQLException e) {
     System.out.println("Error en el proceso ETL:");
@@ -245,15 +286,62 @@ try (Statement stmt = sourceConn.createStatement();
 }
 }
 
-private static List<String> obtenerColumnasDestino(Connection destConn, String tableDestination) throws SQLException {
-    List<String> columnasDestino = new ArrayList<>();
-    DatabaseMetaData metaData = destConn.getMetaData();
-    try (ResultSet columns = metaData.getColumns(null, null, tableDestination, "%")) {
-        while (columns.next()) {
-            columnasDestino.add(columns.getString("COLUMN_NAME"));
+
+    private static List<String> obtenerClavesPrimarias(Connection conn, String tableName) throws SQLException {
+        List<String> primaryKeys = new ArrayList<>();
+        DatabaseMetaData metaData = conn.getMetaData();
+        
+        try (ResultSet rs = metaData.getPrimaryKeys(null, null, tableName)) {
+            while (rs.next()) {
+                primaryKeys.add(rs.getString("COLUMN_NAME"));
+            }
+        }
+        return primaryKeys;
+    }
+
+    private static List<String> obtenerColumnasDestino(Connection destConn, String tableDestination) throws SQLException {
+        List<String> columnasDestino = new ArrayList<>();
+        DatabaseMetaData metaData = destConn.getMetaData();
+        try (ResultSet columns = metaData.getColumns(null, null, tableDestination, "%")) {
+            while (columns.next()) {
+                columnasDestino.add(columns.getString("COLUMN_NAME"));
+            }
+        }
+        return columnasDestino;
+    }
+
+    private static Map<String, String> obtenerMapeoColumnas(Scanner scanner, List<String> columnasOrigen, 
+    List<String> columnasDestino, List<String> primaryKeys) {
+Map<String, String> mapeo = new HashMap<>();
+
+System.out.println("\n=== MAPEO DE COLUMNAS ===");
+System.out.println("Columnas origen: " + String.join(", ", columnasOrigen));
+System.out.println("Columnas destino: " + String.join(", ", columnasDestino));
+if (!primaryKeys.isEmpty()) {
+    System.out.println("Claves primarias detectadas: " + String.join(", ", primaryKeys));
+}
+
+for (String columnaOrigen : columnasOrigen) {
+    System.out.print("A qué columna destino corresponde '" + columnaOrigen + "'? (deje vacío para omitir): ");
+    String columnaDestino = scanner.nextLine().trim();
+    
+    if (columnasDestino.contains(columnaDestino)) {
+        mapeo.put(columnaOrigen, columnaDestino);
+    } else if (!columnaDestino.isEmpty()) {
+        System.out.println("La columna destino '" + columnaDestino + "' no existe. Se omitirá.");
+    }
+}
+
+// Validar que todas las PK estén mapeadas
+if (!primaryKeys.isEmpty()) {
+    for (String pk : primaryKeys) {
+        if (!mapeo.containsValue(pk)) {
+            throw new IllegalArgumentException("La clave primaria '" + pk + "' no está mapeada. Debe mapear todas las claves primarias.");
         }
     }
-    return columnasDestino;
+}
+
+return mapeo;
 }
 
     private static Map<String, String> solicitarTransformaciones(Scanner scanner, List<String> columnas) {
@@ -297,100 +385,144 @@ private static List<String> obtenerColumnasDestino(Connection destConn, String t
         return transformaciones;
     }
 
-    private static String construirMergeSQL(String tableDestination, List<String> columnasOrigen, 
-    List<String> columnasDestino, Connection destConn) throws SQLException {
-    // Primero verificamos si la tabla está vacía
-    boolean tablaVacia = isTablaVacia(destConn, tableDestination);
+    private static String construirUpsertSQL(String tableName, 
+    List<String> columnasOrigen, List<String> columnasDestino, List<String> primaryKeys) {
 
-    if (tablaVacia) {
-        // Construir INSERT simple optimizado usando columnas destino
-        return construirInsertSQL(tableDestination, columnasDestino);
-    } else {
-        // Construir MERGE como antes, pero mapeando origen a destino
-        return construirMergeSQLCompleto(tableDestination, columnasOrigen, columnasDestino);
+StringBuilder sql = new StringBuilder();
+
+// 1. Parte UPDATE
+sql.append("UPDATE ").append(tableName).append(" SET ");
+
+boolean first = true;
+for (String colDest : columnasDestino) {
+    if (!primaryKeys.contains(colDest)) {
+        if (!first) sql.append(", ");
+        sql.append(colDest).append(" = ?");
+        first = false;
     }
-    }
-    private static boolean isTablaVacia(Connection conn, String tableName) throws SQLException {
-        String sql = "SELECT COUNT(*) FROM " + tableName;
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
-            return rs.next() && rs.getInt(1) == 0;
+}
+
+// 2. Condición WHERE con PKs
+sql.append(" WHERE ");
+first = true;
+for (String pk : primaryKeys) {
+    if (!first) sql.append(" AND ");
+    sql.append(pk).append(" = ?");
+    first = false;
+}
+
+// 3. Parte INSERT si no se actualizó
+sql.append("; IF @@ROWCOUNT = 0 BEGIN INSERT INTO ").append(tableName).append(" (")
+   .append(String.join(", ", columnasDestino))
+   .append(") VALUES (");
+
+for (int i = 0; i < columnasDestino.size(); i++) {
+    if (i > 0) sql.append(", ");
+    sql.append("?");
+}
+
+sql.append(") END");
+
+return sql.toString();
+}
+
+    private static String construirMergeSQL(String tableDestination, List<String> columnasOrigen, 
+            List<String> columnasDestino, Connection destConn) throws SQLException {
+        
+        // Obtener la clave primaria de la tabla destino
+        List<String> primaryKeys = obtenerClavesPrimarias(destConn, tableDestination);
+        
+        if (primaryKeys.isEmpty()) {
+            // Si no hay PK, usar INSERT con verificación de existencia para todas las columnas
+            return construirInsertConVerificacion(tableDestination, columnasDestino);
+        } else {
+            // Construir MERGE usando las claves primarias reales
+            return construirMergeSQLCompleto(tableDestination, columnasOrigen, columnasDestino, primaryKeys);
         }
     }
-    
-    private static String construirInsertSQL(String tableDestination, List<String> columnasDestino) {
+
+    private static String construirInsertConVerificacion(String tableName, List<String> columnasDestino) {
         StringBuilder sql = new StringBuilder();
-        sql.append("INSERT INTO ").append(tableDestination).append(" (")
+        
+        sql.append("IF NOT EXISTS (SELECT 1 FROM ").append(tableName).append(" WHERE ");
+        
+        for (int i = 0; i < columnasDestino.size(); i++) {
+            if (i > 0) sql.append(" AND ");
+            sql.append(columnasDestino.get(i)).append(" = ?");
+        }
+        
+        sql.append(") BEGIN INSERT INTO ").append(tableName).append(" (")
            .append(String.join(", ", columnasDestino))
            .append(") VALUES (");
         
-        // Añadir placeholders
         for (int i = 0; i < columnasDestino.size(); i++) {
             if (i > 0) sql.append(", ");
-            sql.append('?');
+            sql.append("?");
         }
         
-        return sql.append(")").toString();
+        sql.append(") END");
+        
+        return sql.toString();
     }
-    
     private static String construirMergeSQLCompleto(String tableDestination, 
-        List<String> columnasOrigen, List<String> columnasDestino) {
-    // Asumimos que la primera columna es la clave primaria para el MERGE
-    // En una implementación real, deberías detectar la clave primaria
-    
+    List<String> columnasOrigen, List<String> columnasDestino, List<String> primaryKeys) {
+
     StringBuilder sql = new StringBuilder();
     sql.append("MERGE INTO ").append(tableDestination).append(" AS destino ")
-       .append("USING (VALUES (");
-    
+    .append("USING (VALUES (");
+
     // Placeholders para los valores de origen
     for (int i = 0; i < columnasOrigen.size(); i++) {
         if (i > 0) sql.append(", ");
         sql.append('?');
     }
-    
-    sql.append(")) AS origen (")
-       .append(String.join(", ", columnasOrigen))
-       .append(") ON destino.")
-       .append(columnasDestino.get(0))
-       .append(" = origen.")
-       .append(columnasOrigen.get(0))
-       .append(" WHEN MATCHED THEN UPDATE SET ");
-    
-    // Actualizar solo las columnas que coinciden (empezando desde la segunda)
-    boolean first = true;
-    for (int i = 1; i < columnasDestino.size(); i++) {
-        if (i >= columnasOrigen.size()) break; // No más columnas en origen
-        
-        if (!first) sql.append(", ");
-        sql.append("destino.").append(columnasDestino.get(i))
-           .append(" = origen.").append(columnasOrigen.get(i));
-        first = false;
-    }
-    
-    sql.append(" WHEN NOT MATCHED THEN INSERT (")
-       .append(String.join(", ", columnasDestino))
-       .append(") VALUES (");
-    
-    // Valores para INSERT - usar placeholders para las columnas destino
-    first = true;
-    for (int i = 0; i < columnasDestino.size(); i++) {
-        if (!first) sql.append(", ");
-        sql.append('?');
-        first = false;
-    }
-    
-    return sql.append(");").toString();
-}
 
-    private static void aplicarTransformacionesYEjectuarMerge(ResultSet rs, PreparedStatement pstmt, 
-            List<String> columnas, Map<String, String> transformaciones, int columnCount) throws SQLException {
-        for (int i = 0; i < columnCount; i++) {
-            String columna = columnas.get(i);
-            Object valor = aplicarTransformacion(rs.getObject(columna), transformaciones.get(columna));
-            pstmt.setObject(i + 1, valor);
-            pstmt.setObject(i + 1 + columnCount, valor);
+    sql.append(")) AS origen (")
+    .append(String.join(", ", columnasOrigen))
+    .append(") ON ");
+
+    // Condición de coincidencia basada en todas las claves primarias
+    boolean firstCondition = true;
+    for (String pk : primaryKeys) {
+        int index = columnasDestino.indexOf(pk);
+        if (index >= 0 && index < columnasOrigen.size()) {
+            if (!firstCondition) sql.append(" AND ");
+            sql.append("destino.").append(pk)
+            .append(" = origen.").append(columnasOrigen.get(index));
+            firstCondition = false;
         }
-        pstmt.executeUpdate();
+    }
+
+    // Si no se pudo mapear ninguna PK, lanzar excepción
+    if (firstCondition) {
+        throw new IllegalArgumentException("No se pudo mapear ninguna clave primaria para la condición MERGE");
+    }
+
+    sql.append(" WHEN MATCHED THEN UPDATE SET ");
+
+    // Actualizar solo las columnas que no son PK
+    boolean firstUpdate = true;
+    for (int i = 0; i < columnasDestino.size(); i++) {
+        String colDest = columnasDestino.get(i);
+        if (!primaryKeys.contains(colDest)) {
+            if (!firstUpdate) sql.append(", ");
+            sql.append("destino.").append(colDest)
+            .append(" = origen.").append(columnasOrigen.get(i));
+            firstUpdate = false;
+        }
+    }
+
+    sql.append(" WHEN NOT MATCHED THEN INSERT (")
+    .append(String.join(", ", columnasDestino))
+    .append(") VALUES (");
+
+    // Valores para INSERT (usar nombres de columnas origen)
+    for (int i = 0; i < columnasDestino.size(); i++) {
+        if (i > 0) sql.append(", ");
+        sql.append("origen.").append(columnasOrigen.get(i));
+    }
+
+    return sql.append(");").toString();
     }
 
     private static Object aplicarTransformacion(Object valor, String transformacion) {
